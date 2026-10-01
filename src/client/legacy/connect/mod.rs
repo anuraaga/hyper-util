@@ -441,3 +441,85 @@ mod tests {
         assert_eq!(ex2.get::<Ex2>(), Some(&Ex2("hiccup")));
     }
 }
+
+// ===== connect hints =====
+
+/// Steers one connection attempt and reports what it found.
+///
+/// The legacy client's pool sets a hint around the connector future with
+/// [`WithConnectHint`]; [`HttpConnector`] reads it when it resolves and dials,
+/// so the two can cooperate through any connector layers in between.
+#[derive(Debug)]
+pub(crate) struct ConnectHint {
+    /// The address this attempt should dial first, if the pool has a preference.
+    pub(crate) preferred: Option<std::net::IpAddr>,
+    /// Every address the host name resolved to, filled in by the connector.
+    resolved: std::sync::Mutex<Vec<std::net::IpAddr>>,
+    /// The address actually connected to, filled in by the connector.
+    connected: std::sync::Mutex<Option<std::net::IpAddr>>,
+}
+
+thread_local! {
+    static CONNECT_HINT: std::cell::RefCell<Option<Arc<ConnectHint>>> = const { std::cell::RefCell::new(None) };
+}
+
+impl ConnectHint {
+    pub(crate) fn new(preferred: Option<std::net::IpAddr>) -> Self {
+        ConnectHint {
+            preferred,
+            resolved: std::sync::Mutex::new(Vec::new()),
+            connected: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// The hint for the connection attempt currently being polled, if any.
+    pub(crate) fn current() -> Option<Arc<ConnectHint>> {
+        CONNECT_HINT.with(|hint| hint.borrow().clone())
+    }
+
+    pub(crate) fn set_resolved(&self, addrs: Vec<std::net::IpAddr>) {
+        *self.resolved.lock().unwrap() = addrs;
+    }
+
+    pub(crate) fn resolved(&self) -> Vec<std::net::IpAddr> {
+        self.resolved.lock().unwrap().clone()
+    }
+
+    pub(crate) fn set_connected(&self, addr: std::net::IpAddr) {
+        *self.connected.lock().unwrap() = Some(addr);
+    }
+
+    pub(crate) fn connected(&self) -> Option<std::net::IpAddr> {
+        *self.connected.lock().unwrap()
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// Polls a connect future with a [`ConnectHint`] visible to the connector.
+    pub(crate) struct WithConnectHint<F> {
+        #[pin]
+        fut: F,
+        hint: Arc<ConnectHint>,
+    }
+}
+
+impl<F> WithConnectHint<F> {
+    pub(crate) fn new(fut: F, hint: Arc<ConnectHint>) -> Self {
+        WithConnectHint { fut, hint }
+    }
+}
+
+impl<F: std::future::Future> std::future::Future for WithConnectHint<F> {
+    type Output = F::Output;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.project();
+        let previous = CONNECT_HINT.with(|hint| hint.replace(Some(this.hint.clone())));
+        let polled = this.fut.poll(cx);
+        CONNECT_HINT.with(|hint| *hint.borrow_mut() = previous);
+        polled
+    }
+}

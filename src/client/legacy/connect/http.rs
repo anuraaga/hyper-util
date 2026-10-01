@@ -549,6 +549,8 @@ where
     R: Resolve,
 {
     async fn call_async(&mut self, dst: Uri) -> Result<TokioIo<TcpStream>, ConnectError> {
+        // Read the hint before the first await: it is scoped to each poll.
+        let hint = super::ConnectHint::current();
         let config = &self.config;
 
         let (host, port) = get_host_port(config, &dst)?;
@@ -572,9 +574,28 @@ where
             dns::SocketAddrs::new(addrs)
         };
 
+        let addrs = match &hint {
+            Some(hint) => {
+                let mut addrs: Vec<SocketAddr> = addrs.collect();
+                hint.set_resolved(addrs.iter().map(SocketAddr::ip).collect());
+                if let Some(preferred) = hint.preferred {
+                    if let Some(index) = addrs.iter().position(|addr| addr.ip() == preferred) {
+                        let addr = addrs.remove(index);
+                        addrs.insert(0, addr);
+                    }
+                }
+                dns::SocketAddrs::new(addrs)
+            }
+            None => addrs,
+        };
+
         let c = ConnectingTcp::new(addrs, config);
 
         let sock = c.connect().await?;
+
+        if let (Some(hint), Ok(peer)) = (&hint, sock.peer_addr()) {
+            hint.set_connected(peer.ip());
+        }
 
         if let Err(e) = sock.set_nodelay(config.nodelay) {
             warn!("tcp set_nodelay error: {}", e);

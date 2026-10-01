@@ -8,6 +8,7 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::future::poll_fn;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{self, Poll};
 use std::time::Duration;
 
@@ -22,7 +23,7 @@ use tracing::{debug, trace, warn};
 #[cfg(feature = "tokio")]
 use super::connect::HttpConnector;
 use super::connect::capture::CaptureConnectionExtension;
-use super::connect::{Alpn, Connect, Connected, Connection};
+use super::connect::{Alpn, Connect, ConnectHint, Connected, Connection, WithConnectHint};
 use super::pool::{self, Ver};
 
 use crate::common::{Exec, Lazy, SyncWrapper, lazy as hyper_lazy, timer};
@@ -345,6 +346,11 @@ where
             extra.set(res.extensions_mut());
         }
 
+        // Keep the slot on a shared connection until the response is dropped.
+        if let Some(lease) = pooled.take_lease() {
+            res.extensions_mut().insert(std::sync::Arc::new(lease));
+        }
+
         // If pooled is HTTP/2, we can toss this reference immediately.
         //
         // when pooled is dropped, it will try to insert back into the
@@ -415,7 +421,6 @@ where
         //   and then be inserted into the pool as an idle connection.
         let checkout = self.pool.checkout(pool_key.clone());
         let connect = self.connect_to(pool_key);
-        let is_ver_h2 = self.config.ver == Ver::Http2;
 
         // The order of the `select` is depended on below...
 
@@ -467,7 +472,10 @@ where
             Either::Right((Err(err), checkout)) => {
                 if err.is_canceled() {
                     checkout.await.map_err(move |err| {
-                        if is_ver_h2 && err.is_canceled() {
+                        // A canceled checkout means the shared connection
+                        // that was being made filled up before this request
+                        // got a slot; try again, which starts another one.
+                        if err.is_canceled() {
                             ClientConnectError::CheckoutIsClosed(err)
                         } else {
                             ClientConnectError::Normal(e!(Connect, err))
@@ -510,13 +518,36 @@ where
                     return Either::Right(future::err(canceled));
                 }
             };
+            let preferred = pool.take_preferred(&pool_key);
             let dst = domain_as_uri(pool_key);
+            let hint = Arc::new(ConnectHint::new(preferred));
+            let connect = WithConnectHint::new(
+                connector.connect(super::connect::sealed::Internal, dst),
+                hint.clone(),
+            );
+            let failed_pool = pool.clone();
+            let failed_hint = hint.clone();
             Either::Left(
-                connector
-                    .connect(super::connect::sealed::Internal, dst)
-                    .map_err(|src| e!(Connect, src))
+                Box::pin(connect)
+                    .map_err(move |src| {
+                        if let Some(ip) = failed_hint.preferred {
+                            failed_pool.mark_unreachable(ip);
+                        }
+                        e!(Connect, src)
+                    })
                     .and_then(move |io| {
                         let connected = io.connected();
+                        let endpoint = hint.connected().map(|remote| pool::EndpointInfo {
+                            remote,
+                            resolved: hint.resolved().into(),
+                        });
+                        if let (Some(preferred), Some(endpoint)) = (hint.preferred, &endpoint) {
+                            if endpoint.remote != preferred {
+                                // The preferred address did not answer and the
+                                // connector fell back to another one.
+                                pool.mark_unreachable(preferred);
+                            }
+                        }
                         // If ALPN is h2 and we aren't http2_only already,
                         // then we need to convert our pool checkout into
                         // a single HTTP2 one.
@@ -557,6 +588,17 @@ where
                                     // Wait for 'conn' to ready up before we
                                     // declare this tx as usable
                                     tx.ready().await.map_err(Error::tx)?;
+
+                                    // Learn the peer's stream limit before the
+                                    // pool shares this connection, so it is never
+                                    // handed out past what the server allows.
+                                    tx.remote_settings().await.map_err(Error::tx)?;
+                                    if tx.remote_max_send_streams() == Some(0) {
+                                        return Err(e!(
+                                            Connect,
+                                            "peer allows no concurrent HTTP/2 streams"
+                                        ));
+                                    }
                                     PoolTx::Http2(tx)
                                 }
                                 #[cfg(not(feature = "http2"))]
@@ -657,6 +699,7 @@ where
                                 PoolClient {
                                     conn_info: connected,
                                     tx,
+                                    endpoint,
                                 },
                             ))
                         }))
@@ -766,6 +809,7 @@ impl Future for ResponseFuture {
 struct PoolClient<B> {
     conn_info: Connected,
     tx: PoolTx<B>,
+    endpoint: Option<pool::EndpointInfo>,
 }
 
 enum PoolTx<B> {
@@ -861,16 +905,19 @@ where
             PoolTx::Http1(tx) => pool::Reservation::Unique(PoolClient {
                 conn_info: self.conn_info,
                 tx: PoolTx::Http1(tx),
+                endpoint: self.endpoint,
             }),
             #[cfg(feature = "http2")]
             PoolTx::Http2(tx) => {
                 let b = PoolClient {
                     conn_info: self.conn_info.clone(),
                     tx: PoolTx::Http2(tx.clone()),
+                    endpoint: self.endpoint.clone(),
                 };
                 let a = PoolClient {
                     conn_info: self.conn_info,
                     tx: PoolTx::Http2(tx),
+                    endpoint: self.endpoint,
                 };
                 pool::Reservation::Shared(a, b)
             }
@@ -879,6 +926,20 @@ where
 
     fn can_share(&self) -> bool {
         self.is_http2()
+    }
+
+    fn max_shared(&self) -> usize {
+        match self.tx {
+            #[cfg(feature = "http1")]
+            PoolTx::Http1(_) => 1,
+            #[cfg(feature = "http2")]
+            // Gated on `remote_settings()` when connecting, so this is known.
+            PoolTx::Http2(ref tx) => tx.remote_max_send_streams().unwrap_or(0),
+        }
+    }
+
+    fn endpoint(&self) -> Option<&pool::EndpointInfo> {
+        self.endpoint.as_ref()
     }
 }
 
@@ -1043,6 +1104,7 @@ impl Builder {
             pool_config: pool::Config {
                 idle_timeout: Some(Duration::from_secs(90)),
                 max_idle_per_host: usize::MAX,
+                balance_addresses: false,
             },
             pool_timer: None,
         }
@@ -1092,6 +1154,19 @@ impl Builder {
     /// Default is `usize::MAX` (no limit).
     pub fn pool_max_idle_per_host(&mut self, max_idle: usize) -> &mut Self {
         self.pool_config.max_idle_per_host = max_idle;
+        self
+    }
+
+    /// Balance HTTP/2 connections across the addresses a host resolves to.
+    ///
+    /// When enabled, a request opens a connection to an address the host
+    /// resolves to that has none yet, instead of reusing a connection with
+    /// spare streams, and requests go to the least loaded connection. An
+    /// address that fails to connect is skipped for a while.
+    ///
+    /// Default is false.
+    pub fn pool_balance_addresses(&mut self, enabled: bool) -> &mut Self {
+        self.pool_config.balance_addresses = enabled;
         self
     }
 

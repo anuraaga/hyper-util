@@ -5,8 +5,10 @@ use std::convert::Infallible;
 use std::error::Error as StdError;
 use std::fmt::{self, Debug};
 use std::hash::Hash;
+use std::net::IpAddr;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{self, Poll, ready};
 
@@ -38,7 +40,31 @@ pub trait Poolable: Unpin + Send + Sized + 'static {
     /// Allows for HTTP/2 to return a shared reservation.
     fn reserve(self) -> Reservation<Self>;
     fn can_share(&self) -> bool;
+    /// The number of leases a shared connection can hold at once.
+    ///
+    /// Only consulted for connections that `can_share`. Defaults to no limit,
+    /// which is the previous behavior of one shared connection taking every
+    /// request.
+    fn max_shared(&self) -> usize {
+        usize::MAX
+    }
+    /// Where this connection went and what else it could have gone to, for
+    /// balancing across addresses.
+    fn endpoint(&self) -> Option<&EndpointInfo> {
+        None
+    }
 }
+
+/// The address a pooled connection is connected to, and every address the
+/// host resolved to at the time.
+#[derive(Clone, Debug)]
+pub struct EndpointInfo {
+    pub remote: IpAddr,
+    pub resolved: Arc<[IpAddr]>,
+}
+
+/// How long an address that failed to connect is left out of balancing.
+const UNREACHABLE_BACKOFF: Duration = Duration::from_secs(30);
 
 pub trait Key: Eq + Hash + Clone + Debug + Unpin + Send + 'static {}
 
@@ -82,6 +108,13 @@ struct PoolInner<T, K: Eq + Hash> {
     // state, waiting to receive a new Request to send on the socket.
     idle: HashMap<K, Vec<Idle<T>>>,
     max_idle_per_host: usize,
+    // Keep a shared connection to every address a host resolves to, see
+    // `uncovered_address`.
+    balance_addresses: bool,
+    // The address the next connection for a key should dial first.
+    preferred: HashMap<K, IpAddr>,
+    // Addresses that recently failed to connect, and when.
+    unreachable: HashMap<IpAddr, Instant>,
     // These are outstanding Checkouts that are waiting for a socket to be
     // able to send a Request one. This is used when "racing" for a new
     // connection.
@@ -91,7 +124,7 @@ struct PoolInner<T, K: Eq + Hash> {
     // this list is checked for any parked Checkouts, and tries to notify
     // them that the Conn could be used instead of waiting for a brand new
     // connection.
-    waiters: HashMap<K, VecDeque<oneshot::Sender<T>>>,
+    waiters: HashMap<K, VecDeque<oneshot::Sender<(T, Option<Slot>)>>>,
     // A oneshot channel is used to allow the interval to be notified when
     // the Pool completely drops. That way, the interval can cancel immediately.
     idle_interval_ref: Option<oneshot::Sender<Infallible>>,
@@ -104,10 +137,82 @@ struct PoolInner<T, K: Eq + Hash> {
 // doesn't need it!
 struct WeakOpt<T>(Option<Weak<T>>);
 
+/// The number of leases currently held on one shared connection.
+#[derive(Debug, Default)]
+pub struct Load {
+    active: AtomicUsize,
+}
+
+impl Load {
+    fn active(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
+}
+
+/// One slot taken on a shared connection, released on drop without touching
+/// the pool. Used while handing a connection to a waiter, where the pool lock
+/// is already held.
+#[derive(Debug)]
+pub struct Slot(Arc<Load>);
+
+impl Slot {
+    fn take(load: &Arc<Load>) -> Slot {
+        load.active.fetch_add(1, Ordering::AcqRel);
+        Slot(load.clone())
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// A lease on a shared connection. Dropping it releases the slot and lets the
+/// pool hand the connection to a waiting checkout.
+pub struct Lease<T: Poolable, K: Key> {
+    slot: Option<Slot>,
+    key: K,
+    pool: WeakOpt<Mutex<PoolInner<T, K>>>,
+}
+
+impl<T: Poolable, K: Key> Lease<T, K> {
+    fn new(slot: Slot, key: K, pool: WeakOpt<Mutex<PoolInner<T, K>>>) -> Self {
+        Lease {
+            slot: Some(slot),
+            key,
+            pool,
+        }
+    }
+}
+
+impl<T: Poolable, K: Key> fmt::Debug for Lease<T, K> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Lease").field("key", &self.key).finish()
+    }
+}
+
+impl<T: Poolable, K: Key> Drop for Lease<T, K> {
+    fn drop(&mut self) {
+        let Some(slot) = self.slot.take() else {
+            return;
+        };
+        let load = slot.0.clone();
+        // Release the slot before taking the lock so waiters see the capacity.
+        drop(slot);
+        if let Some(pool) = self.pool.upgrade() {
+            if let Ok(mut inner) = pool.lock() {
+                inner.release(&self.key, &load);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
     pub idle_timeout: Option<Duration>,
     pub max_idle_per_host: usize,
+    pub balance_addresses: bool,
 }
 
 impl Config {
@@ -130,6 +235,9 @@ impl<T, K: Key> Pool<T, K> {
                 idle: HashMap::new(),
                 idle_interval_ref: None,
                 max_idle_per_host: config.max_idle_per_host,
+                balance_addresses: config.balance_addresses,
+                preferred: HashMap::new(),
+                unreachable: HashMap::new(),
                 waiters: HashMap::new(),
                 exec,
                 timer,
@@ -146,6 +254,12 @@ impl<T, K: Key> Pool<T, K> {
         self.inner.is_some()
     }
 
+    fn weak(&self) -> WeakOpt<Mutex<PoolInner<T, K>>> {
+        self.inner
+            .as_ref()
+            .map_or_else(WeakOpt::none, WeakOpt::downgrade)
+    }
+
     #[cfg(test)]
     pub(super) fn no_timer(&self) {
         // Prevent an actual interval from being created for this pool...
@@ -159,6 +273,22 @@ impl<T, K: Key> Pool<T, K> {
 }
 
 impl<T: Poolable, K: Key> Pool<T, K> {
+    /// The address the next connection for `key` should dial first, chosen by
+    /// the balancing policy at checkout.
+    pub fn take_preferred(&self, key: &K) -> Option<IpAddr> {
+        self.inner.as_ref()?.lock().unwrap().preferred.remove(key)
+    }
+
+    /// Remembers that `ip` could not be connected to, so the balancing policy
+    /// stops asking for it for a while.
+    pub fn mark_unreachable(&self, ip: IpAddr) {
+        if let Some(inner) = &self.inner {
+            let mut inner = inner.lock().unwrap();
+            let now = inner.now();
+            inner.unreachable.insert(ip, now);
+        }
+    }
+
     /// Returns a `Checkout` which is a future that resolves if an idle
     /// connection becomes available.
     pub fn checkout(&self, key: K) -> Checkout<T, K> {
@@ -224,12 +354,19 @@ impl<T: Poolable, K: Key> Pool<T, K> {
         #[cfg_attr(not(feature = "http2"), allow(unused_mut))] mut connecting: Connecting<T, K>,
         value: T,
     ) -> Pooled<T, K> {
+        let mut lease = None;
         let (value, pool_ref) = if let Some(ref enabled) = self.inner {
             match value.reserve() {
                 #[cfg(feature = "http2")]
                 Reservation::Shared(to_insert, to_return) => {
+                    let load = Arc::new(Load::default());
+                    lease = Some(Lease::new(
+                        Slot::take(&load),
+                        connecting.key.clone(),
+                        WeakOpt::downgrade(enabled),
+                    ));
                     let mut inner = enabled.lock().unwrap();
-                    inner.put(connecting.key.clone(), to_insert, enabled);
+                    inner.put_shared(connecting.key.clone(), to_insert, load, enabled);
                     // Do this here instead of Drop for Connecting because we
                     // already have a lock, no need to lock the mutex twice.
                     inner.connected(&connecting.key);
@@ -260,10 +397,11 @@ impl<T: Poolable, K: Key> Pool<T, K> {
             is_reused: false,
             pool: pool_ref,
             value: Some(value),
+            lease,
         }
     }
 
-    fn reuse(&self, key: &K, value: T) -> Pooled<T, K> {
+    fn reuse(&self, key: &K, value: T, lease: Option<Lease<T, K>>) -> Pooled<T, K> {
         debug!("reuse idle connection for {:?}", key);
         // TODO: unhack this
         // In Pool::pooled(), which is used for inserting brand new connections,
@@ -285,6 +423,7 @@ impl<T: Poolable, K: Key> Pool<T, K> {
             key: key.clone(),
             pool: pool_ref,
             value: Some(value),
+            lease,
         }
     }
 }
@@ -295,45 +434,134 @@ struct IdlePopper<'a, T, K> {
     list: &'a mut Vec<Idle<T>>,
 }
 
+/// A connection taken from the idle list, with the slot held on it when it
+/// is shared.
+struct Popped<T> {
+    value: T,
+    slot: Option<Slot>,
+}
+
+/// An address the host resolves to that no open shared connection in `list`
+/// is connected to, skipping addresses that recently failed.
+fn uncovered_address<T: Poolable>(
+    list: &[Idle<T>],
+    unreachable: &HashMap<IpAddr, Instant>,
+    now: Instant,
+) -> Option<IpAddr> {
+    let mut covered = Vec::new();
+    let mut resolved = None;
+    for entry in list {
+        let Some(endpoint) = entry.value.endpoint() else {
+            continue;
+        };
+        if entry.value.is_open() {
+            covered.push(endpoint.remote);
+        }
+        // The newest connection has the freshest view of the name.
+        resolved = Some(&endpoint.resolved);
+    }
+    resolved?.iter().copied().find(|ip| {
+        !covered.contains(ip)
+            && unreachable
+                .get(ip)
+                .is_none_or(|failed| now.saturating_duration_since(*failed) > UNREACHABLE_BACKOFF)
+    })
+}
+
+/// Takes the least loaded shared connection that still has capacity, leaving
+/// it in the list.
+fn pop_shared<T: Poolable>(list: &mut Vec<Idle<T>>) -> Option<Popped<T>> {
+    let mut best: Option<(usize, usize)> = None;
+    for (index, entry) in list.iter().enumerate() {
+        let Some(load) = entry.load.as_ref() else {
+            continue;
+        };
+        if !entry.value.is_open() {
+            continue;
+        }
+        let active = load.active();
+        if active >= entry.value.max_shared() {
+            continue;
+        }
+        if best.is_none_or(|(_, best_active)| active < best_active) {
+            best = Some((index, active));
+        }
+    }
+    let (index, _) = best?;
+    let Idle {
+        value,
+        idle_at,
+        load,
+    } = list.remove(index);
+    let load = load.expect("shared entry has load");
+    match value.reserve() {
+        #[cfg(feature = "http2")]
+        Reservation::Shared(to_reinsert, to_checkout) => {
+            let slot = Slot::take(&load);
+            list.insert(
+                index,
+                Idle {
+                    idle_at,
+                    value: to_reinsert,
+                    load: Some(load),
+                },
+            );
+            Some(Popped {
+                value: to_checkout,
+                slot: Some(slot),
+            })
+        }
+        Reservation::Unique(unique) => Some(Popped {
+            value: unique,
+            slot: None,
+        }),
+    }
+}
+
 impl<'a, T: Poolable + 'a, K: Debug> IdlePopper<'a, T, K> {
-    fn pop(self, expiration: &Expiration, now: Instant) -> Option<Idle<T>> {
-        while let Some(entry) = self.list.pop() {
-            // If the connection has been closed, or is older than our idle
-            // timeout, simply drop it and keep looking...
+    fn pop(self, expiration: &Expiration, now: Instant) -> Option<Popped<T>> {
+        // Drop closed and expired connections first. A shared connection
+        // with leases is in use and cannot be expired.
+        let key = self.key;
+        self.list.retain(|entry| {
             if !entry.value.is_open() {
-                trace!("removing closed connection for {:?}", self.key);
-                continue;
+                trace!("removing closed connection for {:?}", key);
+                return false;
             }
-            // TODO: Actually, since the `idle` list is pushed to the end always,
-            // that would imply that if *this* entry is expired, then anything
-            // "earlier" in the list would *have* to be expired also... Right?
-            //
-            // In that case, we could just break out of the loop and drop the
-            // whole list...
-            if expiration.expires(entry.idle_at, now) {
-                trace!("removing expired connection for {:?}", self.key);
-                continue;
+            let in_use = entry.load.as_ref().is_some_and(|load| load.active() > 0);
+            if !in_use && expiration.expires(entry.idle_at, now) {
+                trace!("removing expired connection for {:?}", key);
+                return false;
             }
+            true
+        });
 
-            let value = match entry.value.reserve() {
-                #[cfg(feature = "http2")]
-                Reservation::Shared(to_reinsert, to_checkout) => {
-                    self.list.push(Idle {
-                        idle_at: now,
-                        value: to_reinsert,
-                    });
-                    to_checkout
-                }
-                Reservation::Unique(unique) => unique,
-            };
-
-            return Some(Idle {
-                idle_at: entry.idle_at,
-                value,
-            });
+        // Prefer a shared connection with capacity.
+        if let Some(popped) = pop_shared(self.list) {
+            return Some(popped);
         }
 
-        None
+        // Otherwise take the most recently idle unique connection.
+        let index = self.list.iter().rposition(|entry| entry.load.is_none())?;
+        let entry = self.list.remove(index);
+        match entry.value.reserve() {
+            #[cfg(feature = "http2")]
+            Reservation::Shared(to_reinsert, to_checkout) => {
+                self.list.push(Idle {
+                    idle_at: now,
+                    value: to_reinsert,
+                    load: None,
+                });
+                Some(Popped {
+                    value: to_checkout,
+                    slot: None,
+                })
+            }
+            Reservation::Unique(unique) => Some(Popped {
+                value: unique,
+                slot: None,
+            }),
+        }
     }
 }
 
@@ -344,9 +572,82 @@ impl<T: Poolable, K: Key> PoolInner<T, K> {
             .map_or_else(|| Instant::now(), |t| t.now())
     }
 
+    /// Adds a shared (HTTP/2) connection to the idle list and hands it to
+    /// waiters while it has capacity.
+    fn put_shared(
+        &mut self,
+        key: K,
+        value: T,
+        load: Arc<Load>,
+        __pool_ref: &Arc<Mutex<PoolInner<T, K>>>,
+    ) {
+        let now = self.now();
+        let idle_list = self.idle.entry(key.clone()).or_default();
+        let shared = idle_list
+            .iter()
+            .filter(|entry| entry.load.is_some())
+            .count();
+        if self.max_idle_per_host <= shared {
+            trace!("max shared per host for {:?}, dropping connection", key);
+            return;
+        }
+        debug!("pooling shared connection for {:?}", key);
+        idle_list.push(Idle {
+            value,
+            idle_at: now,
+            load: Some(load),
+        });
+        self.serve_waiters(&key);
+        self.spawn_idle_interval(__pool_ref);
+    }
+
+    /// Hands shared connections with capacity to waiting checkouts.
+    fn serve_waiters(&mut self, key: &K) {
+        let Some(idle_list) = self.idle.get_mut(key) else {
+            return;
+        };
+        let Some(waiters) = self.waiters.get_mut(key) else {
+            return;
+        };
+        while let Some(tx) = waiters.front() {
+            if tx.is_canceled() {
+                trace!("serve; removing canceled waiter for {:?}", key);
+                waiters.pop_front();
+                continue;
+            }
+            let Some(popped) = pop_shared(idle_list) else {
+                break;
+            };
+            let tx = waiters.pop_front().expect("front checked");
+            if tx.send((popped.value, popped.slot)).is_err() {
+                // The waiter went away between the check and the send; the
+                // slot is released with the dropped message.
+                trace!("serve; waiter gone for {:?}", key);
+            }
+        }
+        if waiters.is_empty() {
+            self.waiters.remove(key);
+        }
+    }
+
+    /// A lease on a shared connection ended.
+    fn release(&mut self, key: &K, load: &Arc<Load>) {
+        if load.active() == 0 {
+            let now = self.now();
+            if let Some(idle_list) = self.idle.get_mut(key) {
+                for entry in idle_list.iter_mut() {
+                    if entry.load.as_ref().is_some_and(|l| Arc::ptr_eq(l, load)) {
+                        entry.idle_at = now;
+                    }
+                }
+            }
+        }
+        self.serve_waiters(key);
+    }
+
     fn put(&mut self, key: K, value: T, __pool_ref: &Arc<Mutex<PoolInner<T, K>>>) {
-        if value.can_share() && self.idle.contains_key(&key) {
-            trace!("put; existing idle HTTP/2 connection for {:?}", key);
+        if value.can_share() {
+            self.put_shared(key, value, Arc::new(Load::default()), __pool_ref);
             return;
         }
         trace!("put; add idle connection for {:?}", key);
@@ -364,7 +665,7 @@ impl<T: Poolable, K: Key> PoolInner<T, K> {
                         }
                         Reservation::Unique(uniq) => uniq,
                     };
-                    match tx.send(reserved) {
+                    match tx.send((reserved, None)) {
                         Ok(()) => {
                             if value.is_none() {
                                 break;
@@ -372,7 +673,7 @@ impl<T: Poolable, K: Key> PoolInner<T, K> {
                                 continue;
                             }
                         }
-                        Err(e) => {
+                        Err((e, _)) => {
                             value = Some(e);
                         }
                     }
@@ -401,6 +702,7 @@ impl<T: Poolable, K: Key> PoolInner<T, K> {
                     idle_list.push(Idle {
                         value,
                         idle_at: now,
+                        load: None,
                     });
                 }
 
@@ -492,6 +794,10 @@ impl<T: Poolable, K: Key> PoolInner<T, K> {
                     return false;
                 }
 
+                if entry.load.as_ref().is_some_and(|load| load.active() > 0) {
+                    return true;
+                }
+
                 // Avoid `Instant::sub` to avoid issues like rust-lang/rust#86470.
                 if now.saturating_duration_since(entry.idle_at) > dur {
                     trace!("idle interval evicting expired for {:?}", key);
@@ -523,11 +829,18 @@ pub struct Pooled<T: Poolable, K: Key> {
     is_reused: bool,
     key: K,
     pool: WeakOpt<Mutex<PoolInner<T, K>>>,
+    lease: Option<Lease<T, K>>,
 }
 
 impl<T: Poolable, K: Key> Pooled<T, K> {
     pub fn is_reused(&self) -> bool {
         self.is_reused
+    }
+
+    /// Takes the lease held on a shared connection, if any, so that it can
+    /// outlive this handle, for example until a response body is finished.
+    pub fn take_lease(&mut self) -> Option<Lease<T, K>> {
+        self.lease.take()
     }
 
     pub fn is_pool_enabled(&self) -> bool {
@@ -587,6 +900,8 @@ impl<T: Poolable, K: Key> fmt::Debug for Pooled<T, K> {
 struct Idle<T> {
     idle_at: Instant,
     value: T,
+    // Present for shared connections, counting leases held on them.
+    load: Option<Arc<Load>>,
 }
 
 // FIXME: allow() required due to `impl Trait` leaking types to this lint
@@ -594,7 +909,7 @@ struct Idle<T> {
 pub struct Checkout<T, K: Key> {
     key: K,
     pool: Pool<T, K>,
-    waiter: Option<oneshot::Receiver<T>>,
+    waiter: Option<oneshot::Receiver<(T, Option<Slot>)>>,
 }
 
 #[derive(Debug)]
@@ -606,8 +921,15 @@ pub enum Error {
 }
 
 impl Error {
+    /// Whether the request never got a connection through no fault of the
+    /// destination, so the client should try again: the value it was handed
+    /// had closed, or the connection being made filled up before this waiter
+    /// got a slot on it.
     pub(super) fn is_canceled(&self) -> bool {
-        matches!(self, Error::CheckedOutClosedValue)
+        matches!(
+            self,
+            Error::CheckedOutClosedValue | Error::CheckoutNoLongerWanted
+        )
     }
 }
 
@@ -630,9 +952,11 @@ impl<T: Poolable, K: Key> Checkout<T, K> {
     ) -> Poll<Option<Result<Pooled<T, K>, Error>>> {
         if let Some(mut rx) = self.waiter.take() {
             match Pin::new(&mut rx).poll(cx) {
-                Poll::Ready(Ok(value)) => {
+                Poll::Ready(Ok((value, slot))) => {
                     if value.is_open() {
-                        Poll::Ready(Some(Ok(self.pool.reuse(&self.key, value))))
+                        let lease =
+                            slot.map(|slot| Lease::new(slot, self.key.clone(), self.pool.weak()));
+                        Poll::Ready(Some(Ok(self.pool.reuse(&self.key, value, lease))))
                     } else {
                         Poll::Ready(Some(Err(Error::CheckedOutClosedValue)))
                     }
@@ -655,26 +979,37 @@ impl<T: Poolable, K: Key> Checkout<T, K> {
             let mut inner = self.pool.inner.as_ref()?.lock().unwrap();
             let expiration = Expiration::new(inner.timeout);
             let now = inner.now();
-            let maybe_entry = inner.idle.get_mut(&self.key).and_then(|list| {
+            let inner = &mut *inner;
+            let mut preferred = None;
+            let maybe_entry = inner.idle.get_mut(&self.key).map(|list| {
                 trace!("take? {:?}: expiration = {:?}", self.key, expiration.0);
+                // When balancing, an address without a connection wins over
+                // reusing one: ask for a connection to it instead.
+                if inner.balance_addresses {
+                    if let Some(ip) = uncovered_address(list, &inner.unreachable, now) {
+                        trace!("balance; connect to uncovered {:?} for {:?}", ip, self.key);
+                        preferred = Some(ip);
+                        return (None, list.is_empty());
+                    }
+                }
                 // A block to end the mutable borrow on list,
                 // so the map below can check is_empty()
-                {
+                let popped = {
                     let popper = IdlePopper {
                         key: &self.key,
                         list,
                     };
                     popper.pop(&expiration, now)
-                }
-                .map(|e| (e, list.is_empty()))
+                };
+                // Shared connections without capacity stay in the list, so
+                // only drop the list when it is actually empty.
+                (popped, list.is_empty())
             });
+            if let Some(ip) = preferred {
+                inner.preferred.insert(self.key.clone(), ip);
+            }
 
-            let (entry, empty) = if let Some((e, empty)) = maybe_entry {
-                (Some(e), empty)
-            } else {
-                // No entry found means nuke the list for sure.
-                (None, true)
-            };
+            let (entry, empty) = maybe_entry.unwrap_or((None, true));
             if empty {
                 //TODO: This could be done with the HashMap::entry API instead.
                 inner.idle.remove(&self.key);
@@ -697,7 +1032,12 @@ impl<T: Poolable, K: Key> Checkout<T, K> {
             entry
         };
 
-        entry.map(|e| self.pool.reuse(&self.key, e.value))
+        entry.map(|popped| {
+            let lease = popped
+                .slot
+                .map(|slot| Lease::new(slot, self.key.clone(), self.pool.weak()));
+            self.pool.reuse(&self.key, popped.value, lease)
+        })
     }
 }
 
@@ -893,6 +1233,7 @@ mod tests {
             super::Config {
                 idle_timeout: Some(Duration::from_millis(100)),
                 max_idle_per_host: max_idle,
+                balance_addresses: false,
             },
             TokioExecutor::new(),
             Option::<timer::Timer>::None,
@@ -1000,6 +1341,7 @@ mod tests {
             super::Config {
                 idle_timeout: Some(Duration::from_millis(10)),
                 max_idle_per_host: usize::MAX,
+                balance_addresses: false,
             },
             TokioExecutor::new(),
             Some(TokioTimer::new()),
