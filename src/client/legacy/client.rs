@@ -4,6 +4,7 @@
 //! For now, to enable people to use hyper 1.0 quicker, this `Client` exists
 //! in much the same way it did in hyper 0.14.
 
+use std::cell::Cell;
 use std::error::Error as StdError;
 use std::fmt;
 use std::future::poll_fn;
@@ -1083,6 +1084,37 @@ pub struct Builder {
     pool_timer: Option<timer::Timer>,
 }
 
+/// Pool options for a [`Client`] built by code that does not expose its
+/// [`Builder`], such as a library wrapping this client.
+///
+/// Set them with [`with_pool_options`] around the call that builds the
+/// client; a `Builder` created on the same thread inside that call starts
+/// from them. Fields left `None` keep the defaults.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PoolOptions {
+    /// See [`Builder::pool_max_connections_per_address`].
+    pub max_connections_per_address: Option<usize>,
+    /// See [`Builder::pool_dns_load_balancing`].
+    pub dns_load_balancing: Option<bool>,
+}
+
+thread_local! {
+    static SCOPED_POOL_OPTIONS: Cell<Option<PoolOptions>> = const { Cell::new(None) };
+}
+
+/// Runs `f` with `options` as the starting pool options of every [`Builder`]
+/// created on this thread during the call.
+pub fn with_pool_options<R>(options: PoolOptions, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<PoolOptions>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SCOPED_POOL_OPTIONS.with(|scoped| scoped.set(self.0));
+        }
+    }
+    let _restore = Restore(SCOPED_POOL_OPTIONS.with(|scoped| scoped.replace(Some(options))));
+    f()
+}
+
 impl Builder {
     /// Construct a new Builder.
     pub fn new<E>(executor: E) -> Self
@@ -1090,7 +1122,7 @@ impl Builder {
         E: hyper::rt::Executor<BoxSendFuture> + Send + Sync + Clone + 'static,
     {
         let exec = Exec::new(executor);
-        Self {
+        let mut builder = Self {
             client_config: Config {
                 retry_canceled_requests: true,
                 set_host: true,
@@ -1108,7 +1140,16 @@ impl Builder {
                 dns_load_balancing: false,
             },
             pool_timer: None,
+        };
+        if let Some(options) = SCOPED_POOL_OPTIONS.with(Cell::get) {
+            if let Some(max) = options.max_connections_per_address {
+                builder.pool_max_connections_per_address(max);
+            }
+            if let Some(enabled) = options.dns_load_balancing {
+                builder.pool_dns_load_balancing(enabled);
+            }
         }
+        builder
     }
     /// Set an optional timeout for idle sockets being kept-alive.
     /// A `Timer` is required for this to take effect. See `Builder::pool_timer`
@@ -1158,13 +1199,14 @@ impl Builder {
         self
     }
 
-    /// Sets the maximum number of open HTTP/2 connections to each address a
-    /// host resolves to.
+    /// Sets the maximum number of open connections to each address a host
+    /// resolves to.
     ///
     /// A new connection goes to an address under its cap, so a host with
     /// several addresses may have up to that many times `max` connections in
-    /// total. Once every address is at its cap, a request goes to the least
-    /// loaded connection and waits there for a stream instead.
+    /// total. Once every address is at its cap, a request waits instead: on
+    /// HTTP/2 it goes to the least loaded connection and waits there for a
+    /// stream, on HTTP/1 it waits for a connection to be returned.
     ///
     /// Default is no limit.
     pub fn pool_max_connections_per_address(&mut self, max: usize) -> &mut Self {

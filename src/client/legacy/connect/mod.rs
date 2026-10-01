@@ -452,11 +452,11 @@ mod tests {
 #[derive(Debug)]
 pub(crate) struct ConnectHint {
     /// The address this attempt should dial first, if the pool has a preference.
-    pub(crate) preferred: Option<std::net::IpAddr>,
+    pub(crate) preferred: Option<std::net::SocketAddr>,
     /// Every address the host name resolved to, filled in by the connector.
-    resolved: std::sync::Mutex<Vec<std::net::IpAddr>>,
+    resolved: std::sync::Mutex<Vec<std::net::SocketAddr>>,
     /// The address actually connected to, filled in by the connector.
-    connected: std::sync::Mutex<Option<std::net::IpAddr>>,
+    connected: std::sync::Mutex<Option<std::net::SocketAddr>>,
 }
 
 thread_local! {
@@ -464,7 +464,7 @@ thread_local! {
 }
 
 impl ConnectHint {
-    pub(crate) fn new(preferred: Option<std::net::IpAddr>) -> Self {
+    pub(crate) fn new(preferred: Option<std::net::SocketAddr>) -> Self {
         ConnectHint {
             preferred,
             resolved: std::sync::Mutex::new(Vec::new()),
@@ -477,19 +477,19 @@ impl ConnectHint {
         CONNECT_HINT.with(|hint| hint.borrow().clone())
     }
 
-    pub(crate) fn set_resolved(&self, addrs: Vec<std::net::IpAddr>) {
+    pub(crate) fn set_resolved(&self, addrs: Vec<std::net::SocketAddr>) {
         *self.resolved.lock().unwrap() = addrs;
     }
 
-    pub(crate) fn resolved(&self) -> Vec<std::net::IpAddr> {
+    pub(crate) fn resolved(&self) -> Vec<std::net::SocketAddr> {
         self.resolved.lock().unwrap().clone()
     }
 
-    pub(crate) fn set_connected(&self, addr: std::net::IpAddr) {
+    pub(crate) fn set_connected(&self, addr: std::net::SocketAddr) {
         *self.connected.lock().unwrap() = Some(addr);
     }
 
-    pub(crate) fn connected(&self) -> Option<std::net::IpAddr> {
+    pub(crate) fn connected(&self) -> Option<std::net::SocketAddr> {
         *self.connected.lock().unwrap()
     }
 }

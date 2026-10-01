@@ -577,9 +577,9 @@ where
         let addrs = match &hint {
             Some(hint) => {
                 let mut addrs: Vec<SocketAddr> = addrs.collect();
-                hint.set_resolved(addrs.iter().map(SocketAddr::ip).collect());
+                hint.set_resolved(addrs.clone());
                 if let Some(preferred) = hint.preferred {
-                    if let Some(index) = addrs.iter().position(|addr| addr.ip() == preferred) {
+                    if let Some(index) = addrs.iter().position(|addr| *addr == preferred) {
                         let addr = addrs.remove(index);
                         addrs.insert(0, addr);
                     }
@@ -594,7 +594,7 @@ where
         let sock = c.connect().await?;
 
         if let (Some(hint), Ok(peer)) = (&hint, sock.peer_addr()) {
-            hint.set_connected(peer.ip());
+            hint.set_connected(peer);
         }
 
         if let Err(e) = sock.set_nodelay(config.nodelay) {

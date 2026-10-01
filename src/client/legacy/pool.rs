@@ -5,7 +5,7 @@ use std::convert::Infallible;
 use std::error::Error as StdError;
 use std::fmt::{self, Debug};
 use std::hash::Hash;
-use std::net::IpAddr;
+use std::net::SocketAddr;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -56,11 +56,12 @@ pub trait Poolable: Unpin + Send + Sized + 'static {
 }
 
 /// The address a pooled connection is connected to, and every address the
-/// host resolved to at the time.
+/// host resolved to at the time. These carry ports, since a resolver may map
+/// one name to several ports.
 #[derive(Clone, Debug)]
 pub struct EndpointInfo {
-    pub remote: IpAddr,
-    pub resolved: Arc<[IpAddr]>,
+    pub remote: SocketAddr,
+    pub resolved: Arc<[SocketAddr]>,
 }
 
 /// How long an address that failed to connect is left out of balancing.
@@ -104,19 +105,27 @@ struct PoolInner<T, K: Eq + Hash> {
     // should be shared. This prevents making multiple HTTP/2 connections
     // to the same host.
     connecting: HashSet<K>,
+    // Connections being established per key, of any version.
+    connecting_count: HashMap<K, usize>,
+    // Unique (HTTP/1) connections checked out per key and address. They are
+    // not in `idle` while in use, so this is what makes them countable.
+    unique_out: HashMap<K, HashMap<Option<SocketAddr>, usize>>,
+    // Every address a key resolved to, as of its newest connection.
+    resolved: HashMap<K, Arc<[SocketAddr]>>,
     // These are internal Conns sitting in the event loop in the KeepAlive
     // state, waiting to receive a new Request to send on the socket.
     idle: HashMap<K, Vec<Idle<T>>>,
     max_idle_per_host: usize,
-    // Open shared connections per resolved address; past this a request
-    // queues on the least loaded connection instead of making more.
+    // Open connections per resolved address; past this a request queues on
+    // the least loaded shared connection, or waits for a unique one to be
+    // returned, instead of making more.
     max_connections_per_address: usize,
     // Keep a shared connection to every address a host name resolves to.
     dns_load_balancing: bool,
     // The address the next connection for a key should dial first.
-    preferred: HashMap<K, IpAddr>,
+    preferred: HashMap<K, SocketAddr>,
     // Addresses that recently failed to connect, and when.
-    unreachable: HashMap<IpAddr, Instant>,
+    unreachable: HashMap<SocketAddr, Instant>,
     // These are outstanding Checkouts that are waiting for a socket to be
     // able to send a Request one. This is used when "racing" for a new
     // connection.
@@ -235,6 +244,9 @@ impl<T, K: Key> Pool<T, K> {
         let inner = if config.is_enabled() {
             Some(Arc::new(Mutex::new(PoolInner {
                 connecting: HashSet::new(),
+                connecting_count: HashMap::new(),
+                unique_out: HashMap::new(),
+                resolved: HashMap::new(),
                 idle: HashMap::new(),
                 idle_interval_ref: None,
                 max_idle_per_host: config.max_idle_per_host,
@@ -279,13 +291,13 @@ impl<T, K: Key> Pool<T, K> {
 impl<T: Poolable, K: Key> Pool<T, K> {
     /// The address the next connection for `key` should dial first, chosen by
     /// the balancing policy at checkout.
-    pub fn take_preferred(&self, key: &K) -> Option<IpAddr> {
+    pub fn take_preferred(&self, key: &K) -> Option<SocketAddr> {
         self.inner.as_ref()?.lock().unwrap().preferred.remove(key)
     }
 
     /// Remembers that `ip` could not be connected to, so the balancing policy
     /// stops asking for it for a while.
-    pub fn mark_unreachable(&self, ip: IpAddr) {
+    pub fn mark_unreachable(&self, ip: SocketAddr) {
         if let Some(inner) = &self.inner {
             let mut inner = inner.lock().unwrap();
             let now = inner.now();
@@ -306,28 +318,27 @@ impl<T: Poolable, K: Key> Pool<T, K> {
     /// Ensure that there is only ever 1 connecting task for HTTP/2
     /// connections. This does nothing for HTTP/1.
     pub fn connecting(&self, key: &K, ver: Ver) -> Option<Connecting<T, K>> {
-        if ver == Ver::Http2 {
-            if let Some(ref enabled) = self.inner {
-                let mut inner = enabled.lock().unwrap();
-                return if inner.connecting.insert(key.clone()) {
-                    let connecting = Connecting {
-                        key: key.clone(),
-                        pool: WeakOpt::downgrade(enabled),
-                    };
-                    Some(connecting)
-                } else {
-                    trace!("HTTP/2 connecting already in progress for {:?}", key);
-                    None
-                };
-            }
+        let Some(enabled) = &self.inner else {
+            return Some(Connecting {
+                key: key.clone(),
+                ver,
+                pool: WeakOpt::none(),
+            });
+        };
+        let mut inner = enabled.lock().unwrap();
+        if inner.at_connection_cap(key) {
+            trace!("every address at its connection cap for {:?}", key);
+            return None;
         }
-
-        // else
+        if ver == Ver::Http2 && !inner.connecting.insert(key.clone()) {
+            trace!("HTTP/2 connecting already in progress for {:?}", key);
+            return None;
+        }
+        *inner.connecting_count.entry(key.clone()).or_default() += 1;
         Some(Connecting {
             key: key.clone(),
-            // in HTTP/1's case, there is never a lock, so we don't
-            // need to do anything in Drop.
-            pool: WeakOpt::none(),
+            ver,
+            pool: WeakOpt::downgrade(enabled),
         })
     }
 
@@ -370,10 +381,11 @@ impl<T: Poolable, K: Key> Pool<T, K> {
                         WeakOpt::downgrade(enabled),
                     ));
                     let mut inner = enabled.lock().unwrap();
+                    inner.note_resolved(&connecting.key, &to_insert);
                     inner.put_shared(connecting.key.clone(), to_insert, load, enabled);
                     // Do this here instead of Drop for Connecting because we
                     // already have a lock, no need to lock the mutex twice.
-                    inner.connected(&connecting.key);
+                    inner.connected(&connecting.key, connecting.ver);
                     // prevent the Drop of Connecting from repeating inner.connected()
                     connecting.pool = WeakOpt::none();
 
@@ -382,6 +394,11 @@ impl<T: Poolable, K: Key> Pool<T, K> {
                     (to_return, WeakOpt::none())
                 }
                 Reservation::Unique(value) => {
+                    let mut inner = enabled.lock().unwrap();
+                    inner.note_resolved(&connecting.key, &value);
+                    inner.unique_taken(&connecting.key, &value);
+                    inner.connected(&connecting.key, connecting.ver);
+                    connecting.pool = WeakOpt::none();
                     // Unique reservations must take a reference to the pool
                     // since they hope to reinsert once the reservation is
                     // completed
@@ -418,6 +435,7 @@ impl<T: Poolable, K: Key> Pool<T, K> {
         let mut pool_ref = WeakOpt::none();
         if !value.can_share() {
             if let Some(ref enabled) = self.inner {
+                enabled.lock().unwrap().unique_taken(key, &value);
                 pool_ref = WeakOpt::downgrade(enabled);
             }
         }
@@ -445,55 +463,57 @@ struct Popped<T> {
     slot: Option<Slot>,
 }
 
-/// Open shared connections per address the host resolves to, in resolution
-/// order, skipping addresses that recently failed to connect. `None` when
-/// the list has no shared connection to learn the addresses from.
+/// Open connections per address the host resolves to, in resolution order,
+/// skipping addresses that recently failed to connect. Shared connections
+/// and idle unique ones are in the idle list; unique ones in use are counted
+/// separately.
 struct AddressStats {
-    counts: Vec<(IpAddr, usize)>,
+    counts: Vec<(SocketAddr, usize)>,
 }
 
 impl AddressStats {
     fn new<T: Poolable>(
+        resolved: &[SocketAddr],
         list: &[Idle<T>],
-        unreachable: &HashMap<IpAddr, Instant>,
+        unique_out: Option<&HashMap<Option<SocketAddr>, usize>>,
+        unreachable: &HashMap<SocketAddr, Instant>,
         now: Instant,
     ) -> Option<Self> {
-        // The newest shared connection has the freshest view of the name.
-        let resolved = list
-            .iter()
-            .filter(|entry| entry.load.is_some())
-            .filter_map(|entry| entry.value.endpoint())
-            .last()?
-            .resolved
-            .clone();
         let counts = resolved
             .iter()
             .copied()
-            .filter(|ip| {
-                unreachable.get(ip).is_none_or(|failed| {
+            .filter(|addr| {
+                unreachable.get(addr).is_none_or(|failed| {
                     now.saturating_duration_since(*failed) > UNREACHABLE_BACKOFF
                 })
             })
-            .map(|ip| {
-                let count = list
+            .map(|addr| {
+                let idle = list
                     .iter()
                     .filter(|entry| {
-                        entry.load.is_some()
-                            && entry.value.is_open()
+                        entry.value.is_open()
                             && entry
                                 .value
                                 .endpoint()
-                                .is_some_and(|endpoint| endpoint.remote == ip)
+                                .is_some_and(|endpoint| endpoint.remote == addr)
                     })
                     .count();
-                (ip, count)
+                let out = unique_out
+                    .and_then(|out| out.get(&Some(addr)))
+                    .copied()
+                    .unwrap_or(0);
+                (addr, idle + out)
             })
             .collect();
         Some(AddressStats { counts })
     }
 
+    fn total(&self) -> usize {
+        self.counts.iter().map(|(_, count)| count).sum()
+    }
+
     /// An address with no connection yet.
-    fn uncovered(&self) -> Option<IpAddr> {
+    fn uncovered(&self) -> Option<SocketAddr> {
         self.counts
             .iter()
             .find(|(_, count)| *count == 0)
@@ -503,7 +523,7 @@ impl AddressStats {
     /// An address with fewer than `max` connections: the least connected one
     /// when `least`, otherwise the first in resolution order, which is what
     /// the connector would dial on its own.
-    fn under_cap(&self, max: usize, least: bool) -> Option<IpAddr> {
+    fn under_cap(&self, max: usize, least: bool) -> Option<SocketAddr> {
         let under = self.counts.iter().filter(|(_, count)| *count < max);
         if least {
             under.min_by_key(|(_, count)| *count)
@@ -582,8 +602,8 @@ impl<'a, T: Poolable + 'a, K: Debug> IdlePopper<'a, T, K> {
         expiration: &Expiration,
         now: Instant,
         policy: SharedPolicy,
-        unreachable: &HashMap<IpAddr, Instant>,
-    ) -> (Option<Popped<T>>, Option<IpAddr>) {
+        stats: Option<AddressStats>,
+    ) -> (Option<Popped<T>>, Option<SocketAddr>) {
         // Drop closed and expired connections first. A shared connection
         // with leases is in use and cannot be expired.
         let key = self.key;
@@ -600,8 +620,6 @@ impl<'a, T: Poolable + 'a, K: Debug> IdlePopper<'a, T, K> {
             true
         });
 
-        let stats = AddressStats::new(self.list, unreachable, now);
-
         // When balancing, an address without a connection wins over reusing
         // one: ask for a connection to it instead.
         if policy.dns_load_balancing {
@@ -616,51 +634,54 @@ impl<'a, T: Poolable + 'a, K: Debug> IdlePopper<'a, T, K> {
             return (Some(popped), None);
         }
 
-        if let Some(stats) = stats {
-            // Every shared connection is full. Make another if some address
-            // is under its cap, steering the connector unless nothing limits
-            // it; otherwise queue on the least loaded connection.
-            let steer =
-                policy.dns_load_balancing || policy.max_connections_per_address != usize::MAX;
-            if let Some(ip) = stats.under_cap(
-                policy.max_connections_per_address,
-                policy.dns_load_balancing,
-            ) {
-                return (None, steer.then_some(ip));
-            }
-            if let Some(popped) = pop_shared(self.list, true) {
-                trace!(
-                    "every address at its connection cap for {:?}, queueing",
-                    key
-                );
-                return (Some(popped), None);
-            }
+        // Then the most recently idle unique connection.
+        if let Some(index) = self.list.iter().rposition(|entry| entry.load.is_none()) {
+            let entry = self.list.remove(index);
+            let popped = match entry.value.reserve() {
+                #[cfg(feature = "http2")]
+                Reservation::Shared(to_reinsert, to_checkout) => {
+                    self.list.push(Idle {
+                        idle_at: now,
+                        value: to_reinsert,
+                        load: None,
+                    });
+                    Popped {
+                        value: to_checkout,
+                        slot: None,
+                    }
+                }
+                Reservation::Unique(unique) => Popped {
+                    value: unique,
+                    slot: None,
+                },
+            };
+            return (Some(popped), None);
         }
 
-        // Otherwise take the most recently idle unique connection.
-        let Some(index) = self.list.iter().rposition(|entry| entry.load.is_none()) else {
+        let Some(stats) = stats else {
             return (None, None);
         };
-        let entry = self.list.remove(index);
-        let popped = match entry.value.reserve() {
-            #[cfg(feature = "http2")]
-            Reservation::Shared(to_reinsert, to_checkout) => {
-                self.list.push(Idle {
-                    idle_at: now,
-                    value: to_reinsert,
-                    load: None,
-                });
-                Popped {
-                    value: to_checkout,
-                    slot: None,
-                }
-            }
-            Reservation::Unique(unique) => Popped {
-                value: unique,
-                slot: None,
-            },
-        };
-        (Some(popped), None)
+        // Nothing to reuse. Make another connection if some address is under
+        // its cap, steering the connector unless nothing limits it. Otherwise
+        // queue on the least loaded shared connection, or, with only unique
+        // connections, wait for one to come back: `Pool::connecting` refuses
+        // to dial at the cap.
+        let steer = policy.dns_load_balancing || policy.max_connections_per_address != usize::MAX;
+        if let Some(addr) = stats.under_cap(
+            policy.max_connections_per_address,
+            policy.dns_load_balancing,
+        ) {
+            return (None, steer.then_some(addr));
+        }
+        if let Some(popped) = pop_shared(self.list, true) {
+            trace!(
+                "every address at its connection cap for {:?}, queueing",
+                key
+            );
+            return (Some(popped), None);
+        }
+        trace!("every address at its connection cap for {:?}, waiting", key);
+        (None, None)
     }
 }
 
@@ -813,13 +834,96 @@ impl<T: Poolable, K: Key> PoolInner<T, K> {
 
     /// A `Connecting` task is complete. Not necessarily successfully,
     /// but the lock is going away, so clean up.
-    fn connected(&mut self, key: &K) {
-        let existed = self.connecting.remove(key);
-        debug_assert!(existed, "Connecting dropped, key not in pool.connecting");
-        // cancel any waiters. if there are any, it's because
-        // this Connecting task didn't complete successfully.
-        // those waiters would never receive a connection.
-        self.waiters.remove(key);
+    fn connected(&mut self, key: &K, ver: Ver) {
+        if let Some(count) = self.connecting_count.get_mut(key) {
+            *count -= 1;
+            if *count == 0 {
+                self.connecting_count.remove(key);
+            }
+        }
+        if ver == Ver::Http2 {
+            let existed = self.connecting.remove(key);
+            debug_assert!(existed, "Connecting dropped, key not in pool.connecting");
+            // cancel any waiters. if there are any, it's because
+            // this Connecting task didn't complete successfully, or the
+            // connection filled up before they got a slot on it.
+            // Either way they need to try again.
+            self.waiters.remove(key);
+        }
+    }
+
+    /// Drops the oldest waiter so that its request tries again, which is how
+    /// a request parked at the connection cap learns that the connection it
+    /// waited for is gone.
+    fn cancel_one_waiter(&mut self, key: &K) {
+        if let Some(waiters) = self.waiters.get_mut(key) {
+            waiters.pop_front();
+            if waiters.is_empty() {
+                self.waiters.remove(key);
+            }
+        }
+    }
+
+    fn note_resolved(&mut self, key: &K, value: &T) {
+        if let Some(endpoint) = value.endpoint() {
+            self.resolved.insert(key.clone(), endpoint.resolved.clone());
+        }
+    }
+
+    fn unique_taken(&mut self, key: &K, value: &T) {
+        let addr = value.endpoint().map(|endpoint| endpoint.remote);
+        *self
+            .unique_out
+            .entry(key.clone())
+            .or_default()
+            .entry(addr)
+            .or_default() += 1;
+    }
+
+    fn unique_returned(&mut self, key: &K, value: &T) {
+        let addr = value.endpoint().map(|endpoint| endpoint.remote);
+        if let Some(out) = self.unique_out.get_mut(key) {
+            if let Some(count) = out.get_mut(&addr) {
+                *count -= 1;
+                if *count == 0 {
+                    out.remove(&addr);
+                }
+            }
+            if out.is_empty() {
+                self.unique_out.remove(key);
+            }
+        }
+    }
+
+    fn address_stats(&self, key: &K, now: Instant) -> Option<AddressStats> {
+        AddressStats::new(
+            self.resolved.get(key)?,
+            self.idle.get(key).map_or(&[], Vec::as_slice),
+            self.unique_out.get(key),
+            &self.unreachable,
+            now,
+        )
+    }
+
+    /// Whether no address has room for another connection, counting the
+    /// ones being made.
+    fn at_connection_cap(&self, key: &K) -> bool {
+        let max = self.max_connections_per_address;
+        if max == usize::MAX {
+            return false;
+        }
+        let now = self.now();
+        let Some(stats) = self.address_stats(key, now) else {
+            return false;
+        };
+        // With every address backing off, a dial is the only way to learn
+        // whether one came back.
+        if stats.counts.is_empty() {
+            return false;
+        }
+        let connecting = self.connecting_count.get(key).copied().unwrap_or(0);
+        stats.under_cap(max, false).is_none()
+            || stats.total() + connecting >= max * stats.counts.len()
     }
 
     fn spawn_idle_interval(&mut self, pool_ref: &Arc<Mutex<PoolInner<T, K>>>) {
@@ -970,22 +1074,28 @@ impl<T: Poolable, K: Key> DerefMut for Pooled<T, K> {
 
 impl<T: Poolable, K: Key> Drop for Pooled<T, K> {
     fn drop(&mut self) {
-        if let Some(value) = self.value.take() {
-            if !value.is_open() {
-                // If we *already* know the connection is done here,
-                // it shouldn't be re-inserted back into the pool.
-                return;
-            }
-
-            if let Some(pool) = self.pool.upgrade() {
-                if let Ok(mut inner) = pool.lock() {
-                    inner.put(self.key.clone(), value, &pool);
-                }
-            } else if !value.can_share() {
-                trace!("pool dropped, dropping pooled ({:?})", self.key);
-            }
+        let Some(value) = self.value.take() else {
+            return;
+        };
+        if value.can_share() {
             // Ver::Http2 is already in the Pool (or dead), so we wouldn't
             // have an actual reference to the Pool.
+            return;
+        }
+        let Some(pool) = self.pool.upgrade() else {
+            trace!("pool dropped, dropping pooled ({:?})", self.key);
+            return;
+        };
+        if let Ok(mut inner) = pool.lock() {
+            inner.unique_returned(&self.key, &value);
+            if value.is_open() {
+                inner.put(self.key.clone(), value, &pool);
+            } else {
+                // If we *already* know the connection is done here,
+                // it shouldn't be re-inserted back into the pool. A request
+                // waiting for it at the connection cap must try again.
+                inner.cancel_one_waiter(&self.key);
+            }
         }
     }
 }
@@ -1089,11 +1199,20 @@ impl<T: Poolable, K: Key> Checkout<T, K> {
                 // A block to end the mutable borrow on list,
                 // so the map below can check is_empty()
                 let popped = {
+                    let stats = inner.resolved.get(&self.key).and_then(|resolved| {
+                        AddressStats::new(
+                            resolved,
+                            list,
+                            inner.unique_out.get(&self.key),
+                            &inner.unreachable,
+                            now,
+                        )
+                    });
                     let popper = IdlePopper {
                         key: &self.key,
                         list,
                     };
-                    let (popped, hint) = popper.pop(&expiration, now, policy, &inner.unreachable);
+                    let (popped, hint) = popper.pop(&expiration, now, policy, stats);
                     preferred = hint;
                     popped
                 };
@@ -1172,17 +1291,29 @@ impl<T, K: Key> Drop for Checkout<T, K> {
 #[allow(missing_debug_implementations)]
 pub struct Connecting<T: Poolable, K: Key> {
     key: K,
+    ver: Ver,
     pool: WeakOpt<Mutex<PoolInner<T, K>>>,
 }
 
 impl<T: Poolable, K: Key> Connecting<T, K> {
-    pub fn alpn_h2(self, pool: &Pool<T, K>) -> Option<Self> {
+    pub fn alpn_h2(mut self, pool: &Pool<T, K>) -> Option<Self> {
         debug_assert!(
-            self.pool.0.is_none(),
+            self.ver != Ver::Http2,
             "Connecting::alpn_h2 but already Http2"
         );
-
-        pool.connecting(&self.key, Ver::Http2)
+        if let Some(enabled) = &pool.inner {
+            let mut inner = enabled.lock().unwrap();
+            if !inner.connecting.insert(self.key.clone()) {
+                trace!("HTTP/2 connecting already in progress for {:?}", self.key);
+                // This attempt is abandoned, not failed: the request will be
+                // served by the connection that won, so no waiter is canceled.
+                inner.connected(&self.key, self.ver);
+                self.pool = WeakOpt::none();
+                return None;
+            }
+        }
+        self.ver = Ver::Http2;
+        Some(self)
     }
 }
 
@@ -1191,7 +1322,10 @@ impl<T: Poolable, K: Key> Drop for Connecting<T, K> {
         if let Some(pool) = self.pool.upgrade() {
             // No need to panic on drop, that could abort!
             if let Ok(mut inner) = pool.lock() {
-                inner.connected(&self.key);
+                // Only a failed connect gets here: `pooled` clears the pool
+                // reference. A request waiting at the cap counted on it.
+                inner.connected(&self.key, self.ver);
+                inner.cancel_one_waiter(&self.key);
             }
         }
     }
@@ -1281,7 +1415,7 @@ mod tests {
     use std::task::{self, Poll};
     use std::time::Duration;
 
-    use super::{Connecting, Key, Pool, Poolable, Reservation, WeakOpt};
+    use super::{Connecting, Key, Pool, Poolable, Reservation, Ver, WeakOpt};
     use crate::rt::{TokioExecutor, TokioTimer};
 
     use crate::common::timer;
@@ -1312,6 +1446,7 @@ mod tests {
     fn c<T: Poolable, K: Key>(key: K) -> Connecting<T, K> {
         Connecting {
             key,
+            ver: Ver::Auto,
             pool: WeakOpt::none(),
         }
     }
