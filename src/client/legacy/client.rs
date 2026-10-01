@@ -1104,7 +1104,8 @@ impl Builder {
             pool_config: pool::Config {
                 idle_timeout: Some(Duration::from_secs(90)),
                 max_idle_per_host: usize::MAX,
-                balance_addresses: false,
+                max_connections_per_address: usize::MAX,
+                dns_load_balancing: false,
             },
             pool_timer: None,
         }
@@ -1157,7 +1158,21 @@ impl Builder {
         self
     }
 
-    /// Balance HTTP/2 connections across the addresses a host resolves to.
+    /// Sets the maximum number of open HTTP/2 connections to each address a
+    /// host resolves to.
+    ///
+    /// A new connection goes to an address under its cap, so a host with
+    /// several addresses may have up to that many times `max` connections in
+    /// total. Once every address is at its cap, a request goes to the least
+    /// loaded connection and waits there for a stream instead.
+    ///
+    /// Default is no limit.
+    pub fn pool_max_connections_per_address(&mut self, max: usize) -> &mut Self {
+        self.pool_config.max_connections_per_address = max.max(1);
+        self
+    }
+
+    /// Balance HTTP/2 connections across the addresses a host name resolves to.
     ///
     /// When enabled, a request opens a connection to an address the host
     /// resolves to that has none yet, instead of reusing a connection with
@@ -1165,8 +1180,8 @@ impl Builder {
     /// address that fails to connect is skipped for a while.
     ///
     /// Default is false.
-    pub fn pool_balance_addresses(&mut self, enabled: bool) -> &mut Self {
-        self.pool_config.balance_addresses = enabled;
+    pub fn pool_dns_load_balancing(&mut self, enabled: bool) -> &mut Self {
+        self.pool_config.dns_load_balancing = enabled;
         self
     }
 

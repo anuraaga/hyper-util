@@ -108,9 +108,11 @@ struct PoolInner<T, K: Eq + Hash> {
     // state, waiting to receive a new Request to send on the socket.
     idle: HashMap<K, Vec<Idle<T>>>,
     max_idle_per_host: usize,
-    // Keep a shared connection to every address a host resolves to, see
-    // `uncovered_address`.
-    balance_addresses: bool,
+    // Open shared connections per resolved address; past this a request
+    // queues on the least loaded connection instead of making more.
+    max_connections_per_address: usize,
+    // Keep a shared connection to every address a host name resolves to.
+    dns_load_balancing: bool,
     // The address the next connection for a key should dial first.
     preferred: HashMap<K, IpAddr>,
     // Addresses that recently failed to connect, and when.
@@ -212,7 +214,8 @@ impl<T: Poolable, K: Key> Drop for Lease<T, K> {
 pub struct Config {
     pub idle_timeout: Option<Duration>,
     pub max_idle_per_host: usize,
-    pub balance_addresses: bool,
+    pub max_connections_per_address: usize,
+    pub dns_load_balancing: bool,
 }
 
 impl Config {
@@ -235,7 +238,8 @@ impl<T, K: Key> Pool<T, K> {
                 idle: HashMap::new(),
                 idle_interval_ref: None,
                 max_idle_per_host: config.max_idle_per_host,
-                balance_addresses: config.balance_addresses,
+                max_connections_per_address: config.max_connections_per_address,
+                dns_load_balancing: config.dns_load_balancing,
                 preferred: HashMap::new(),
                 unreachable: HashMap::new(),
                 waiters: HashMap::new(),
@@ -441,36 +445,85 @@ struct Popped<T> {
     slot: Option<Slot>,
 }
 
-/// An address the host resolves to that no open shared connection in `list`
-/// is connected to, skipping addresses that recently failed.
-fn uncovered_address<T: Poolable>(
-    list: &[Idle<T>],
-    unreachable: &HashMap<IpAddr, Instant>,
-    now: Instant,
-) -> Option<IpAddr> {
-    let mut covered = Vec::new();
-    let mut resolved = None;
-    for entry in list {
-        let Some(endpoint) = entry.value.endpoint() else {
-            continue;
-        };
-        if entry.value.is_open() {
-            covered.push(endpoint.remote);
-        }
-        // The newest connection has the freshest view of the name.
-        resolved = Some(&endpoint.resolved);
-    }
-    resolved?.iter().copied().find(|ip| {
-        !covered.contains(ip)
-            && unreachable
-                .get(ip)
-                .is_none_or(|failed| now.saturating_duration_since(*failed) > UNREACHABLE_BACKOFF)
-    })
+/// Open shared connections per address the host resolves to, in resolution
+/// order, skipping addresses that recently failed to connect. `None` when
+/// the list has no shared connection to learn the addresses from.
+struct AddressStats {
+    counts: Vec<(IpAddr, usize)>,
 }
 
-/// Takes the least loaded shared connection that still has capacity, leaving
-/// it in the list.
-fn pop_shared<T: Poolable>(list: &mut Vec<Idle<T>>) -> Option<Popped<T>> {
+impl AddressStats {
+    fn new<T: Poolable>(
+        list: &[Idle<T>],
+        unreachable: &HashMap<IpAddr, Instant>,
+        now: Instant,
+    ) -> Option<Self> {
+        // The newest shared connection has the freshest view of the name.
+        let resolved = list
+            .iter()
+            .filter(|entry| entry.load.is_some())
+            .filter_map(|entry| entry.value.endpoint())
+            .last()?
+            .resolved
+            .clone();
+        let counts = resolved
+            .iter()
+            .copied()
+            .filter(|ip| {
+                unreachable.get(ip).is_none_or(|failed| {
+                    now.saturating_duration_since(*failed) > UNREACHABLE_BACKOFF
+                })
+            })
+            .map(|ip| {
+                let count = list
+                    .iter()
+                    .filter(|entry| {
+                        entry.load.is_some()
+                            && entry.value.is_open()
+                            && entry
+                                .value
+                                .endpoint()
+                                .is_some_and(|endpoint| endpoint.remote == ip)
+                    })
+                    .count();
+                (ip, count)
+            })
+            .collect();
+        Some(AddressStats { counts })
+    }
+
+    /// An address with no connection yet.
+    fn uncovered(&self) -> Option<IpAddr> {
+        self.counts
+            .iter()
+            .find(|(_, count)| *count == 0)
+            .map(|(ip, _)| *ip)
+    }
+
+    /// An address with fewer than `max` connections: the least connected one
+    /// when `least`, otherwise the first in resolution order, which is what
+    /// the connector would dial on its own.
+    fn under_cap(&self, max: usize, least: bool) -> Option<IpAddr> {
+        let under = self.counts.iter().filter(|(_, count)| *count < max);
+        if least {
+            under.min_by_key(|(_, count)| *count)
+        } else {
+            under.min_by_key(|_| 0)
+        }
+        .map(|(ip, _)| *ip)
+    }
+}
+
+/// How the pool picks between its shared connections and making another.
+#[derive(Clone, Copy)]
+struct SharedPolicy {
+    max_connections_per_address: usize,
+    dns_load_balancing: bool,
+}
+
+/// Takes the least loaded shared connection, leaving it in the list. Unless
+/// `ignore_limit`, only a connection with stream capacity left qualifies.
+fn pop_shared<T: Poolable>(list: &mut Vec<Idle<T>>, ignore_limit: bool) -> Option<Popped<T>> {
     let mut best: Option<(usize, usize)> = None;
     for (index, entry) in list.iter().enumerate() {
         let Some(load) = entry.load.as_ref() else {
@@ -480,7 +533,7 @@ fn pop_shared<T: Poolable>(list: &mut Vec<Idle<T>>) -> Option<Popped<T>> {
             continue;
         }
         let active = load.active();
-        if active >= entry.value.max_shared() {
+        if !ignore_limit && active >= entry.value.max_shared() {
             continue;
         }
         if best.is_none_or(|(_, best_active)| active < best_active) {
@@ -519,7 +572,18 @@ fn pop_shared<T: Poolable>(list: &mut Vec<Idle<T>>) -> Option<Popped<T>> {
 }
 
 impl<'a, T: Poolable + 'a, K: Debug> IdlePopper<'a, T, K> {
-    fn pop(self, expiration: &Expiration, now: Instant) -> Option<Popped<T>> {
+    /// Takes a connection for a request, or says which address a new
+    /// connection should go to when none should be reused.
+    ///
+    /// The hint is only set when the policy needs to steer the connector;
+    /// `None` with no connection means the connector picks on its own.
+    fn pop(
+        self,
+        expiration: &Expiration,
+        now: Instant,
+        policy: SharedPolicy,
+        unreachable: &HashMap<IpAddr, Instant>,
+    ) -> (Option<Popped<T>>, Option<IpAddr>) {
         // Drop closed and expired connections first. A shared connection
         // with leases is in use and cannot be expired.
         let key = self.key;
@@ -536,15 +600,49 @@ impl<'a, T: Poolable + 'a, K: Debug> IdlePopper<'a, T, K> {
             true
         });
 
+        let stats = AddressStats::new(self.list, unreachable, now);
+
+        // When balancing, an address without a connection wins over reusing
+        // one: ask for a connection to it instead.
+        if policy.dns_load_balancing {
+            if let Some(ip) = stats.as_ref().and_then(AddressStats::uncovered) {
+                trace!("balance; connect to uncovered {:?} for {:?}", ip, key);
+                return (None, Some(ip));
+            }
+        }
+
         // Prefer a shared connection with capacity.
-        if let Some(popped) = pop_shared(self.list) {
-            return Some(popped);
+        if let Some(popped) = pop_shared(self.list, false) {
+            return (Some(popped), None);
+        }
+
+        if let Some(stats) = stats {
+            // Every shared connection is full. Make another if some address
+            // is under its cap, steering the connector unless nothing limits
+            // it; otherwise queue on the least loaded connection.
+            let steer =
+                policy.dns_load_balancing || policy.max_connections_per_address != usize::MAX;
+            if let Some(ip) = stats.under_cap(
+                policy.max_connections_per_address,
+                policy.dns_load_balancing,
+            ) {
+                return (None, steer.then_some(ip));
+            }
+            if let Some(popped) = pop_shared(self.list, true) {
+                trace!(
+                    "every address at its connection cap for {:?}, queueing",
+                    key
+                );
+                return (Some(popped), None);
+            }
         }
 
         // Otherwise take the most recently idle unique connection.
-        let index = self.list.iter().rposition(|entry| entry.load.is_none())?;
+        let Some(index) = self.list.iter().rposition(|entry| entry.load.is_none()) else {
+            return (None, None);
+        };
         let entry = self.list.remove(index);
-        match entry.value.reserve() {
+        let popped = match entry.value.reserve() {
             #[cfg(feature = "http2")]
             Reservation::Shared(to_reinsert, to_checkout) => {
                 self.list.push(Idle {
@@ -552,16 +650,17 @@ impl<'a, T: Poolable + 'a, K: Debug> IdlePopper<'a, T, K> {
                     value: to_reinsert,
                     load: None,
                 });
-                Some(Popped {
+                Popped {
                     value: to_checkout,
                     slot: None,
-                })
+                }
             }
-            Reservation::Unique(unique) => Some(Popped {
+            Reservation::Unique(unique) => Popped {
                 value: unique,
                 slot: None,
-            }),
-        }
+            },
+        };
+        (Some(popped), None)
     }
 }
 
@@ -615,7 +714,7 @@ impl<T: Poolable, K: Key> PoolInner<T, K> {
                 waiters.pop_front();
                 continue;
             }
-            let Some(popped) = pop_shared(idle_list) else {
+            let Some(popped) = pop_shared(idle_list, false) else {
                 break;
             };
             let tx = waiters.pop_front().expect("front checked");
@@ -980,18 +1079,13 @@ impl<T: Poolable, K: Key> Checkout<T, K> {
             let expiration = Expiration::new(inner.timeout);
             let now = inner.now();
             let inner = &mut *inner;
+            let policy = SharedPolicy {
+                max_connections_per_address: inner.max_connections_per_address,
+                dns_load_balancing: inner.dns_load_balancing,
+            };
             let mut preferred = None;
             let maybe_entry = inner.idle.get_mut(&self.key).map(|list| {
                 trace!("take? {:?}: expiration = {:?}", self.key, expiration.0);
-                // When balancing, an address without a connection wins over
-                // reusing one: ask for a connection to it instead.
-                if inner.balance_addresses {
-                    if let Some(ip) = uncovered_address(list, &inner.unreachable, now) {
-                        trace!("balance; connect to uncovered {:?} for {:?}", ip, self.key);
-                        preferred = Some(ip);
-                        return (None, list.is_empty());
-                    }
-                }
                 // A block to end the mutable borrow on list,
                 // so the map below can check is_empty()
                 let popped = {
@@ -999,7 +1093,9 @@ impl<T: Poolable, K: Key> Checkout<T, K> {
                         key: &self.key,
                         list,
                     };
-                    popper.pop(&expiration, now)
+                    let (popped, hint) = popper.pop(&expiration, now, policy, &inner.unreachable);
+                    preferred = hint;
+                    popped
                 };
                 // Shared connections without capacity stay in the list, so
                 // only drop the list when it is actually empty.
@@ -1233,7 +1329,8 @@ mod tests {
             super::Config {
                 idle_timeout: Some(Duration::from_millis(100)),
                 max_idle_per_host: max_idle,
-                balance_addresses: false,
+                max_connections_per_address: usize::MAX,
+                dns_load_balancing: false,
             },
             TokioExecutor::new(),
             Option::<timer::Timer>::None,
@@ -1341,7 +1438,8 @@ mod tests {
             super::Config {
                 idle_timeout: Some(Duration::from_millis(10)),
                 max_idle_per_host: usize::MAX,
-                balance_addresses: false,
+                max_connections_per_address: usize::MAX,
+                dns_load_balancing: false,
             },
             TokioExecutor::new(),
             Some(TokioTimer::new()),
