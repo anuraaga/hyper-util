@@ -64,6 +64,34 @@ pub struct EndpointInfo {
     pub resolved: Arc<[SocketAddr]>,
 }
 
+/// The number of open connections a pool holds for one key and remote
+/// address, split into those currently carrying a request and those that are
+/// idle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectionCount<K> {
+    /// The key the connections were pooled under.
+    pub key: K,
+    /// The remote address of the connections, if the connector reported it.
+    pub peer: Option<SocketAddr>,
+    /// Whether these are shared (HTTP/2) connections.
+    pub shared: bool,
+    /// The number of connections currently carrying at least one request.
+    pub active: usize,
+    /// The number of connections currently carrying no request.
+    pub idle: usize,
+}
+
+/// A [`Pool`] reference that does not keep the pool alive.
+#[allow(missing_debug_implementations)]
+pub struct WeakPool<T, K: Key>(WeakOpt<Mutex<PoolInner<T, K>>>);
+
+impl<T, K: Key> WeakPool<T, K> {
+    /// Returns the pool if it is still alive.
+    pub fn upgrade(&self) -> Option<Pool<T, K>> {
+        self.0.upgrade().map(|inner| Pool { inner: Some(inner) })
+    }
+}
+
 /// How long an address that failed to connect is left out of balancing.
 const UNREACHABLE_BACKOFF: Duration = Duration::from_secs(30);
 
@@ -276,6 +304,11 @@ impl<T, K: Key> Pool<T, K> {
             .map_or_else(WeakOpt::none, WeakOpt::downgrade)
     }
 
+    /// Returns a reference to this pool that does not keep it alive.
+    pub fn downgrade(&self) -> WeakPool<T, K> {
+        WeakPool(self.weak())
+    }
+
     #[cfg(test)]
     pub(super) fn no_timer(&self) {
         // Prevent an actual interval from being created for this pool...
@@ -289,6 +322,50 @@ impl<T, K: Key> Pool<T, K> {
 }
 
 impl<T: Poolable, K: Key> Pool<T, K> {
+    /// Counts the open connections in the pool. A shared connection is active
+    /// while at least one lease is held on it, and a unique connection is
+    /// active while it is checked out. Connections that are still being
+    /// established are not counted.
+    pub fn connection_counts(&self) -> Vec<ConnectionCount<K>> {
+        let Some(inner) = &self.inner else {
+            return Vec::new();
+        };
+        let inner = inner.lock().unwrap();
+        // (active, idle) per key, remote address, and kind.
+        let mut counts: HashMap<(K, Option<SocketAddr>, bool), (usize, usize)> = HashMap::new();
+        for (key, list) in &inner.idle {
+            for entry in list {
+                if !entry.value.is_open() {
+                    continue;
+                }
+                let peer = entry.value.endpoint().map(|endpoint| endpoint.remote);
+                let shared = entry.load.is_some();
+                let active = entry.load.as_ref().is_some_and(|load| load.active() > 0);
+                let count = counts.entry((key.clone(), peer, shared)).or_default();
+                if active {
+                    count.0 += 1;
+                } else {
+                    count.1 += 1;
+                }
+            }
+        }
+        for (key, out) in &inner.unique_out {
+            for (peer, n) in out {
+                counts.entry((key.clone(), *peer, false)).or_default().0 += n;
+            }
+        }
+        counts
+            .into_iter()
+            .map(|((key, peer, shared), (active, idle))| ConnectionCount {
+                key,
+                peer,
+                shared,
+                active,
+                idle,
+            })
+            .collect()
+    }
+
     /// The address the next connection for `key` should dial first, chosen by
     /// the balancing policy at checkout.
     pub fn take_preferred(&self, key: &K) -> Option<SocketAddr> {

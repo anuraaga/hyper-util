@@ -4,7 +4,7 @@
 //! For now, to enable people to use hyper 1.0 quicker, this `Client` exists
 //! in much the same way it did in hyper 0.14.
 
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::error::Error as StdError;
 use std::fmt;
 use std::future::poll_fn;
@@ -25,6 +25,7 @@ use tracing::{debug, trace, warn};
 use super::connect::HttpConnector;
 use super::connect::capture::CaptureConnectionExtension;
 use super::connect::{Alpn, Connect, ConnectHint, Connected, Connection, WithConnectHint};
+use super::metrics::PoolMetrics;
 use super::pool::{self, Ver};
 
 use crate::common::{Exec, Lazy, SyncWrapper, lazy as hyper_lazy, timer};
@@ -91,7 +92,7 @@ macro_rules! e {
 }
 
 // We might change this... :shrug:
-type PoolKey = (http::uri::Scheme, http::uri::Authority);
+pub(super) type PoolKey = (http::uri::Scheme, http::uri::Authority);
 
 enum TrySendError<B> {
     Retryable {
@@ -1082,6 +1083,7 @@ pub struct Builder {
     h2_builder: hyper::client::conn::http2::Builder<Exec>,
     pool_config: pool::Config,
     pool_timer: Option<timer::Timer>,
+    pool_metrics: Option<PoolMetrics>,
 }
 
 /// Pool options for a [`Client`] built by code that does not expose its
@@ -1090,16 +1092,18 @@ pub struct Builder {
 /// Set them with [`with_pool_options`] around the call that builds the
 /// client; a `Builder` created on the same thread inside that call starts
 /// from them. Fields left `None` keep the defaults.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct PoolOptions {
     /// See [`Builder::pool_max_connections_per_address`].
     pub max_connections_per_address: Option<usize>,
     /// See [`Builder::pool_dns_load_balancing`].
     pub dns_load_balancing: Option<bool>,
+    /// See [`Builder::pool_metrics`].
+    pub metrics: Option<PoolMetrics>,
 }
 
 thread_local! {
-    static SCOPED_POOL_OPTIONS: Cell<Option<PoolOptions>> = const { Cell::new(None) };
+    static SCOPED_POOL_OPTIONS: RefCell<Option<PoolOptions>> = const { RefCell::new(None) };
 }
 
 /// Runs `f` with `options` as the starting pool options of every [`Builder`]
@@ -1108,10 +1112,10 @@ pub fn with_pool_options<R>(options: PoolOptions, f: impl FnOnce() -> R) -> R {
     struct Restore(Option<PoolOptions>);
     impl Drop for Restore {
         fn drop(&mut self) {
-            SCOPED_POOL_OPTIONS.with(|scoped| scoped.set(self.0));
+            SCOPED_POOL_OPTIONS.with(|scoped| *scoped.borrow_mut() = self.0.take());
         }
     }
-    let _restore = Restore(SCOPED_POOL_OPTIONS.with(|scoped| scoped.replace(Some(options))));
+    let _restore = Restore(SCOPED_POOL_OPTIONS.with(|scoped| scoped.borrow_mut().replace(options)));
     f()
 }
 
@@ -1140,13 +1144,17 @@ impl Builder {
                 dns_load_balancing: false,
             },
             pool_timer: None,
+            pool_metrics: None,
         };
-        if let Some(options) = SCOPED_POOL_OPTIONS.with(Cell::get) {
+        if let Some(options) = SCOPED_POOL_OPTIONS.with(|scoped| scoped.borrow().clone()) {
             if let Some(max) = options.max_connections_per_address {
                 builder.pool_max_connections_per_address(max);
             }
             if let Some(enabled) = options.dns_load_balancing {
                 builder.pool_dns_load_balancing(enabled);
+            }
+            if let Some(metrics) = options.metrics {
+                builder.pool_metrics(metrics);
             }
         }
         builder
@@ -1224,6 +1232,14 @@ impl Builder {
     /// Default is false.
     pub fn pool_dns_load_balancing(&mut self, enabled: bool) -> &mut Self {
         self.pool_config.dns_load_balancing = enabled;
+        self
+    }
+
+    /// Reports the client's connections through `metrics`.
+    ///
+    /// Default is to report no metrics.
+    pub fn pool_metrics(&mut self, metrics: PoolMetrics) -> &mut Self {
+        self.pool_metrics = Some(metrics);
         self
     }
 
@@ -1745,7 +1761,7 @@ impl Builder {
     #[cfg(feature = "tokio")]
     pub fn build_http<B>(&self) -> Client<HttpConnector, B>
     where
-        B: Body + Send,
+        B: Body + Send + 'static,
         B::Data: Send,
     {
         let mut connector = HttpConnector::new();
@@ -1759,20 +1775,24 @@ impl Builder {
     pub fn build<C, B>(&self, connector: C) -> Client<C, B>
     where
         C: Connect + Clone,
-        B: Body + Send,
+        B: Body + Send + 'static,
         B::Data: Send,
     {
         let exec = self.exec.clone();
         let timer = self.pool_timer.clone();
+        let pool = pool::Pool::new(self.pool_config, exec.clone(), timer);
+        if let Some(metrics) = &self.pool_metrics {
+            metrics.add_pool(pool.downgrade());
+        }
         Client {
             config: self.client_config,
-            exec: exec.clone(),
+            exec,
             #[cfg(feature = "http1")]
             h1_builder: self.h1_builder.clone(),
             #[cfg(feature = "http2")]
             h2_builder: self.h2_builder.clone(),
             connector,
-            pool: pool::Pool::new(self.pool_config, exec, timer),
+            pool,
         }
     }
 }
