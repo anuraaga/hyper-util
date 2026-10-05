@@ -1,27 +1,26 @@
 //! Metrics about the connections of a legacy [`Client`](super::Client).
 
-use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, OnceLock};
 
 use hyper::Version;
 
 use super::client::PoolKey;
 use super::pool::{ConnectionCount, Poolable, WeakPool};
 
-/// Metrics about the connections of one or more [`Client`](super::Client)s.
+/// Metrics about the connections of a [`Client`](super::Client).
 ///
-/// Create a handle, set it on the client with [`Builder::pool_metrics`] or
+/// Create a handle and set it on the client with [`Builder::pool_metrics`] or
 /// [`PoolOptions::metrics`].
 ///
 /// [`Builder::pool_metrics`]: super::Builder::pool_metrics
 /// [`PoolOptions::metrics`]: super::PoolOptions::metrics
 #[derive(Clone, Default)]
 pub struct PoolMetrics {
-    /// Snapshots of the pools of the clients using this handle. A snapshot
-    /// returns `None` once its client has been dropped.
-    pools: Arc<Mutex<Vec<PoolSnapshot>>>,
+    /// A snapshot of the client's pool, set when the client is built. It
+    /// returns `None` once the client has been dropped.
+    pool: Arc<OnceLock<PoolSnapshot>>,
 }
 
 type PoolSnapshot = Box<dyn Fn() -> Option<Vec<ConnectionCount<PoolKey>>> + Send + Sync>;
@@ -54,52 +53,43 @@ pub struct OpenConnections {
 }
 
 impl PoolMetrics {
-    /// Creates a handle with no clients yet.
+    /// Creates a handle that no client has been built with yet.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Adds the pool of a client built with this handle.
-    pub(super) fn add_pool<T: Poolable>(&self, pool: WeakPool<T, PoolKey>) {
+    /// Sets the pool of the client built with this handle. Has no effect if a
+    /// client was already built with it.
+    pub(super) fn set_pool<T: Poolable>(&self, pool: WeakPool<T, PoolKey>) {
         let snapshot: PoolSnapshot = Box::new(move || Some(pool.upgrade()?.connection_counts()));
-        self.pools.lock().unwrap().push(snapshot);
+        let _ = self.pool.set(snapshot);
     }
 
     /// Returns the number of open connections per server, remote address and
-    /// HTTP version, across all clients using this handle. Connections that
-    /// are still being established are not counted.
-    pub fn open_connections(&self) -> Vec<OpenConnections> {
-        // (active, idle) per server, address and version.
-        let mut counts: HashMap<ConnectionInfo, (usize, usize)> = HashMap::new();
-        self.pools.lock().unwrap().retain(|snapshot| {
-            let Some(connections) = snapshot() else {
-                return false;
-            };
-            for count in connections {
-                let connection = ConnectionInfo {
-                    scheme: count.key.0,
-                    authority: count.key.1,
-                    peer: count.peer,
-                    version: if count.shared {
-                        Version::HTTP_2
-                    } else {
-                        Version::HTTP_11
+    /// HTTP version. Connections that are still being established are not
+    /// counted. Returns `None` when there is no live client: none has been
+    /// built with this handle yet, or it has been dropped.
+    pub fn open_connections(&self) -> Option<Vec<OpenConnections>> {
+        let counts = (self.pool.get()?)()?;
+        Some(
+            counts
+                .into_iter()
+                .map(|count| OpenConnections {
+                    connection: ConnectionInfo {
+                        scheme: count.key.0,
+                        authority: count.key.1,
+                        peer: count.peer,
+                        version: if count.shared {
+                            Version::HTTP_2
+                        } else {
+                            Version::HTTP_11
+                        },
                     },
-                };
-                let entry = counts.entry(connection).or_default();
-                entry.0 += count.active;
-                entry.1 += count.idle;
-            }
-            true
-        });
-        counts
-            .into_iter()
-            .map(|(connection, (active, idle))| OpenConnections {
-                connection,
-                active,
-                idle,
-            })
-            .collect()
+                    active: count.active,
+                    idle: count.idle,
+                })
+                .collect(),
+        )
     }
 }
 

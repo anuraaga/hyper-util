@@ -1782,7 +1782,7 @@ impl Builder {
         let timer = self.pool_timer.clone();
         let pool = pool::Pool::new(self.pool_config, exec.clone(), timer);
         if let Some(metrics) = &self.pool_metrics {
-            metrics.add_pool(pool.downgrade());
+            metrics.set_pool(pool.downgrade());
         }
         Client {
             config: self.client_config,
